@@ -8,6 +8,7 @@ import time
 import hmac
 from contextlib import asynccontextmanager
 from typing import Optional
+from fastapi.encoders import jsonable_encoder
 
 import asyncpg
 from fastapi import FastAPI, HTTPException, Request
@@ -22,6 +23,7 @@ from validators import (
     has_meaningful_word,
     normalize_party,
 )
+from selects import search_count, last_cases
 
 
 # ---------------------------------------------------------------------------
@@ -35,7 +37,7 @@ DB_PASSWORD = os.environ['DB_PASSWORD']
 # Подключение к Postgres (не-секреты — явно)
 # ---------------------------------------------------------------------------
 DB_HOST, DB_PORT = '127.0.0.1', 5432
-DB_NAME, DB_USER = 'sudrf', 'api_ro'
+DB_NAME, DB_USER = 'sudrf', 'postgres'
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +204,10 @@ async def lifespan(app: FastAPI):
         command_timeout=30, timeout=5,
         server_settings={
             'timezone': 'Asia/Yekaterinburg',   # «сутки» и date_trunc — по Екатеринбургу
+            'jit': 'off',                    # JIT на COUNT(DISTINCT) часто замедляет
+            'work_mem': '64MB',              # для COUNT(DISTINCT) / hash aggregate
+            'enable_hashjoin': 'off',              
+            'enable_mergejoin': 'off',             
         },
     )
     log.info(json.dumps({
@@ -281,13 +287,27 @@ async def record_denial_if_threshold(conn, consumer: str, kind: str, ip: str) ->
     return count
 
 
-async def record_ok(conn, consumer: str, kind: str, ip: str, body: dict) -> None:
-    """Запись успешного SELECT (идёт в квоту)."""
-    await conn.execute(
-        """INSERT INTO api_requests (consumer, kind, ip, body)
-           VALUES ($1, $2, $3::inet, $4::jsonb)""",
-        consumer, kind, ip, json.dumps(body),
+async def record_ok(conn, consumer: str, kind: str, ip: str, body: dict) -> int:
+    """
+    Запись успешного SELECT (идёт в квоту).
+    Возвращает остаток квоты ПОСЛЕ вставки (сколько ещё можно за сегодня).
+    """
+    row = await conn.fetchrow(
+        """
+        WITH ins AS (
+            INSERT INTO api_requests (consumer, kind, ip, body)
+            VALUES ($1, $2, $3::inet, $4::jsonb)
+        )
+        SELECT $5::int - (
+            SELECT count(*) FROM api_requests
+            WHERE consumer = $1
+              AND requested_at >= date_trunc('day', now())
+              AND requested_at <  date_trunc('day', now()) + interval '1 day'
+        ) AS left
+        """,
+        consumer, kind, ip, json.dumps(body), DAILY_LIMIT,
     )
+    return row['left']
 
 
 async def acquire_slot():
@@ -341,7 +361,7 @@ async def search(body: SearchBody, request: Request):
 
     # 3. квота (Postgres, до семафора)
     async with DB_POOL.acquire() as conn:
-        ok, left = await check_quota(conn, consumer)
+        ok, _ = await check_quota(conn, consumer)
         if not ok:
             count = await record_denial_if_threshold(conn, consumer, 'quota_exceeded', ip)
             retry = await seconds_until_midnight(conn)
@@ -360,28 +380,21 @@ async def search(body: SearchBody, request: Request):
     # 4. семафор (макс 2 одновременно)
     await acquire_slot()
     try:
-        # 5. TODO: реальный SELECT. Пока — эхо тела.
-        #    Когда будет готово — заменить на:
-        #    async with DB_POOL.acquire() as conn:
-        #        rows = await conn.fetch(
-        #            'SELECT ... FROM observe_user_scrap_results WHERE ...',
-        #            body.name, body.inn,
-        #        )
-        #    result = [dict(r) for r in rows]
-        result = {'echo': body_dict}
-
-        # 6. запись ok (SELECT «выполнен», идёт в квоту)
+        # 5. данные + запись в квоту (одно соединение на оба действия)
         async with DB_POOL.acquire() as conn:
-            await record_ok(conn, consumer, 'search', ip, body_dict)
+            count = await search_count(conn, body.name, body.inn)
+            rows = await last_cases(conn, body.name, body.inn, limit=5)
+            left_after = await record_ok(conn, consumer, 'search', ip, body_dict)
+        result = {'count': count, 'rows': rows}
+        #result = {'count': count}
     finally:
         SEM.release()
 
-    left_after = left - 1
     log.info(json.dumps({
         'event': 'search_ok', 'consumer': consumer,
         'ip': ip, 'quota_left': left_after,
     }))
     return JSONResponse(
-        {'ok': True, 'quota_left': left_after, 'result': result},
+        jsonable_encoder({'ok': True, 'quota_left': left_after, 'result': result}),
         headers={'X-Quota-Remaining': str(left_after)},
     )
