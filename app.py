@@ -23,7 +23,7 @@ from validators import (
     has_meaningful_word,
     normalize_party,
 )
-from selects import search_count, last_cases, explain_last_cases
+from selects import search_count, last_cases, explain_last_cases, explain_count
 
 
 # ---------------------------------------------------------------------------
@@ -51,6 +51,8 @@ DAILY_LIMIT      = 100    # квота: успешных SELECT в сутки н
 RATE             = 0.2    # rate limit: токенов в секунду (0.2 = 1 токен за 5 с)
 BURST            = 2      # rate limit: сколько запросов можно сразу (всплеск)
 DENIAL_THRESHOLD = 5      # писать отказ в БД, когда за минуту набралось >= 5
+COUNT_TTL        = 6 * 3600   # сек: сколько хранить count в памяти (сами кейсы всегда свежие)
+COUNT_CACHE_MAX  = 5000       # максимум записей в кэше count
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +74,11 @@ DB_POOL: Optional[asyncpg.Pool] = None
 # Счётчики отказов в памяти: {(consumer, kind, minute_ts): count}
 # Нужны, чтобы писать в БД только при >= DENIAL_THRESHOLD отказов за минуту.
 _denial_counts: dict = {}
+
+
+# Кэш count: {(имя, инн): (истекает_monotonic, count)}. Живёт в памяти процесса
+# (работает при --workers 1), сбрасывается при рестарте.
+_count_cache: dict = {}
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +208,7 @@ async def lifespan(app: FastAPI):
             'timezone': 'Asia/Yekaterinburg',   # «сутки» и date_trunc — по Екатеринбургу
             'jit': 'off',                       # JIT на COUNT(DISTINCT) часто замедляет
             'work_mem': '64MB',                 # для COUNT(DISTINCT) / hash aggregate
+            'effective_io_concurrency': '100',  # опережающее чтение в Bitmap Heap Scan
         },
     )
     log.info(json.dumps({
@@ -313,6 +321,29 @@ async def acquire_slot():
         raise HTTPException(status_code=503, detail='server busy')
 
 
+async def cached_count(conn, name: str, inn: Optional[str], region_id: Optional[int] = None):
+    """
+    count с кэшем по (имя, инн, регион). Возвращает (count, из_кэша).
+    Для крупных имён (Сбербанк и т.п.) подсчёт дорогой, а число меняется медленно.
+    """
+    key = (' '.join(name.lower().split()), inn or '', region_id)
+    now = time.monotonic()
+
+    hit = _count_cache.get(key)
+    if hit and hit[0] > now:
+        return hit[1], True
+
+    count = await search_count(conn, name, inn, region_id)
+
+    if len(_count_cache) >= COUNT_CACHE_MAX:
+        for k in [k for k, v in _count_cache.items() if v[0] <= now]:
+            del _count_cache[k]
+        if len(_count_cache) >= COUNT_CACHE_MAX:
+            _count_cache.pop(next(iter(_count_cache)))   # самый старый
+    _count_cache[key] = (now + COUNT_TTL, count)
+    return count, False
+
+
 # ---------------------------------------------------------------------------
 # Эндпоинты
 # ---------------------------------------------------------------------------
@@ -375,8 +406,8 @@ async def search(body: SearchBody, request: Request):
     try:
         # 5. данные + запись в квоту (одно соединение на оба действия)
         async with DB_POOL.acquire() as conn:
-            count = await search_count(conn, body.name, body.inn)
-            rows = await last_cases(conn, body.name, body.inn, limit=5)
+            count, count_cached = await cached_count(conn, body.name, body.inn, body.region_id)
+            rows = await last_cases(conn, body.name, body.inn, limit=5, region_id=body.region_id)
             left_after = await record_ok(conn, consumer, 'search', ip, body_dict)
         result = {'count': count, 'rows': rows}
     finally:
@@ -384,7 +415,7 @@ async def search(body: SearchBody, request: Request):
 
     log.info(json.dumps({
         'event': 'search_ok', 'consumer': consumer,
-        'ip': ip, 'quota_left': left_after,
+        'ip': ip, 'quota_left': left_after, 'count_cached': count_cached,
     }))
     return JSONResponse(
         jsonable_encoder({'ok': True, 'quota_left': left_after, 'result': result}),
@@ -402,8 +433,14 @@ async def debug_explain(body: SearchBody, request: Request):
     ):
         return JSONResponse({'error': 'unauthorized'}, status_code=401)
 
-    # EXPLAIN ровно того же запроса, который выполняет /search
+    # EXPLAIN ровно тех же запросов, что выполняет /search, в том же порядке:
+    # сначала count, потом последние 5 кейсов. Квоту не тратит.
     async with DB_POOL.acquire() as conn:
-        plan = await explain_last_cases(conn, body.name, body.inn, limit=5)
+        count_plans = await explain_count(conn, body.name, body.inn, body.region_id)
+        cases_plan = await explain_last_cases(conn, body.name, body.inn, limit=5,
+                                              region_id=body.region_id)
 
-    return {'plan': plan.split('\n')}
+    return {
+        'count_plans': {k: v.split('\n') for k, v in count_plans.items()},
+        'plan': cases_plan.split('\n'),      # план last_cases (как и раньше)
+    }
