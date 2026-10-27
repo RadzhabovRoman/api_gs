@@ -302,13 +302,17 @@ async def record_ok(conn, consumer: str, kind: str, ip: str, body: dict) -> int:
         WITH ins AS (
             INSERT INTO api_requests (consumer, kind, ip, body)
             VALUES ($1, $2, $3::inet, $4::jsonb)
+            RETURNING 1
         )
-        SELECT $5::int - (
-            SELECT count(*) FROM api_requests
-            WHERE consumer = $1
-              AND requested_at >= date_trunc('day', now())
-              AND requested_at <  date_trunc('day', now()) + interval '1 day'
-        ) AS left
+        -- основной запрос не видит строку, вставленную в этом же выражении (одна копия снимка),
+        -- поэтому только что записанный запрос добавляем отдельно: + (SELECT count(*) FROM ins)
+        SELECT GREATEST(0, $5::int - (
+            (SELECT count(*) FROM api_requests
+             WHERE consumer = $1
+               AND requested_at >= date_trunc('day', now())
+               AND requested_at <  date_trunc('day', now()) + interval '1 day')
+            + (SELECT count(*) FROM ins)
+        )) AS left
         """,
         consumer, kind, ip, json.dumps(body), DAILY_LIMIT,
     )
