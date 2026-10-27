@@ -32,6 +32,10 @@ from selects import search_count, last_cases, explain_last_cases, explain_count
 API_TOKEN   = os.environ['API_TOKEN']
 DB_PASSWORD = os.environ['DB_PASSWORD']
 
+# /debug/explain выполняет EXPLAIN ANALYZE (реально гоняет тяжёлые запросы мимо лимитов и квоты),
+# поэтому по умолчанию выключен. Для отладки: DEBUG_ENDPOINTS=1 в /etc/api/api.env + рестарт.
+DEBUG_ENDPOINTS = os.environ.get('DEBUG_ENDPOINTS') == '1'
+
 
 # ---------------------------------------------------------------------------
 # Подключение к Postgres (не-секреты — явно)
@@ -406,16 +410,27 @@ async def search(body: SearchBody, request: Request):
     try:
         # 5. данные + запись в квоту (одно соединение на оба действия)
         async with DB_POOL.acquire() as conn:
+            t0 = time.perf_counter()
             count, count_cached = await cached_count(conn, body.name, body.inn, body.region_id)
+            t1 = time.perf_counter()
             rows = await last_cases(conn, body.name, body.inn, limit=5, region_id=body.region_id)
+            t2 = time.perf_counter()
             left_after = await record_ok(conn, consumer, 'search', ip, body_dict)
         result = {'count': count, 'rows': rows}
+    except (asyncio.TimeoutError, asyncpg.exceptions.QueryCanceledError):
+        # запрос не уложился в лимит времени; квота не списывается (record_ok не выполнен)
+        log.warning(json.dumps({
+            'event': 'search_timeout', 'consumer': consumer, 'ip': ip,
+            'is_firm': body.is_firm, 'has_inn': bool(body.inn), 'region_id': body.region_id,
+        }))
+        return JSONResponse({'error': 'query timeout'}, status_code=504)
     finally:
         SEM.release()
 
     log.info(json.dumps({
         'event': 'search_ok', 'consumer': consumer,
         'ip': ip, 'quota_left': left_after, 'count_cached': count_cached,
+        'count_ms': round((t1 - t0) * 1000), 'cases_ms': round((t2 - t1) * 1000),
     }))
     return JSONResponse(
         jsonable_encoder({'ok': True, 'quota_left': left_after, 'result': result}),
@@ -423,7 +438,6 @@ async def search(body: SearchBody, request: Request):
     )
 
 
-@app.post('/debug/explain')
 async def debug_explain(body: SearchBody, request: Request):
     # тот же auth, что у /search
     token = request.headers.get('x-api-key', '')
@@ -444,3 +458,7 @@ async def debug_explain(body: SearchBody, request: Request):
         'count_plans': {k: v.split('\n') for k, v in count_plans.items()},
         'plan': cases_plan.split('\n'),      # план last_cases (как и раньше)
     }
+
+
+if DEBUG_ENDPOINTS:
+    app.post('/debug/explain')(debug_explain)
