@@ -1,188 +1,167 @@
 """
 selects.py — SQL-запросы и обёртки над asyncpg для API.
+
+ВАЖНО: значения inn / name / limit подставляются в SQL ЛИТЕРАЛАМИ (с экранированием),
+а не через $1/$2. Так планировщик Postgres видит константы и строит тот же план,
+что и в pgAdmin (без generic-плана prepared statement).
 """
 from typing import Optional
 
 
+def _lit(value: str) -> str:
+    """Безопасный SQL-литерал строки (аналог quote_literal)."""
+    value = str(value)
+    if "\x00" in value:
+        raise ValueError("NUL character is not allowed in SQL literal")
+    # standard_conforming_strings = on (по умолчанию) -> достаточно удвоить апострофы
+    return "'" + value.replace("'", "''") + "'"
+
+
 # ---------------------------------------------------------------------------
-# COUNT: сколько всего дел по name + inn
+# COUNT: три ветки, как в pgAdmin; суммируются в Python
 # ---------------------------------------------------------------------------
-_COUNT_SQL_BY_INN = """
-    SELECT COUNT(DISTINCT pt.case_id)
-    FROM observe_user_cases_parts AS pt
-    WHERE pt.inn = $1
+_COUNT_BY_INN = """
+SELECT COUNT(DISTINCT pt.case_id)
+FROM observe_user_cases_parts AS pt
+WHERE pt.inn = {inn}
 """
 
-_COUNT_SQL_BY_NAME = """
-    SELECT
-      (SELECT COUNT(DISTINCT pt.case_id)
-       FROM observe_user_cases_parts AS pt
-       WHERE (pt.inn IS NULL OR pt.inn = '')
-         AND to_tsvector('simple', extract_part_name(pt.part_name))
-             @@ plainto_tsquery('simple', norm_party($1))
-      )
-      +
-      (SELECT COUNT(DISTINCT sr.id)
-       FROM observe_user_scrap_results AS sr
-       WHERE sr.has_case_status_3 = false
-         AND (
-           to_tsvector('simple', extract_plaintiff(sr.case_info))
-               @@ plainto_tsquery('simple', norm_party($1))
-           OR to_tsvector('simple', extract_defendant(sr.case_info))
-               @@ plainto_tsquery('simple', norm_party($1))
-         )
-      )
+_COUNT_BY_NAME_PT = """
+SELECT COUNT(DISTINCT pt.case_id)
+FROM observe_user_cases_parts AS pt
+WHERE (pt.inn IS NULL OR pt.inn = '')
+  AND to_tsvector('simple', extract_part_name(pt.part_name)) @@ plainto_tsquery('simple', norm_party({name}))
+"""
+
+_COUNT_BY_NAME_SR = """
+SELECT COUNT(DISTINCT sr.id)
+FROM observe_user_scrap_results AS sr
+WHERE sr.has_case_status_3 = false
+  AND (
+      to_tsvector('simple', extract_plaintiff(sr.case_info)) @@ plainto_tsquery('simple', norm_party({name}))
+      OR to_tsvector('simple', extract_defendant(sr.case_info)) @@ plainto_tsquery('simple', norm_party({name}))
+  )
 """
 
 
+def build_count_sql(name: str, inn: Optional[str]) -> str:
+    """Тот же UNION ALL, что выполняется в pgAdmin (значения — литералы)."""
+    n = _lit(name)
+    parts = []
+    if inn:
+        parts.append(_COUNT_BY_INN.format(inn=_lit(inn)))
+    parts.append(_COUNT_BY_NAME_PT.format(name=n))
+    parts.append(_COUNT_BY_NAME_SR.format(name=n))
+    return "\nUNION ALL\n".join(parts)
+
+
 # ---------------------------------------------------------------------------
-# LAST CASES: 5 самых свежих кейсов.
-#
-# Вариант с inn:  $1 = inn, $2 = limit, $3 = name
-#   ветка 1 (по inn):        $1 (inn),   $2 (limit)
-#   ветки 2-3 (по name):     $3 (name),  $2 (limit)
-#
-# Вариант без inn: $1 = name, $2 = limit
-#   обе ветки:               $1 (name),  $2 (limit)
+# LAST CASES: каждая ветка — отдельный подзапрос с ORDER BY ... LIMIT
 # ---------------------------------------------------------------------------
 
-# --- с inn ---
+# Ветка 1: точный INN
 _LAST_CASES_BY_INN = """
-    (
-        SELECT sr.*
-        FROM observe_user_scrap_results AS sr
-        JOIN observe_user_cases AS cs
-          ON cs.result_id = sr.id AND cs.status_id = 3
-        JOIN observe_user_cases_parts AS pt
-          ON pt.case_id = cs.id AND pt.inn = $1
-        ORDER BY sr.date_in DESC NULLS LAST, sr.id DESC
-        LIMIT $2
-    )
+SELECT sr.*
+FROM observe_user_scrap_results AS sr
+JOIN observe_user_cases AS cs ON cs.result_id = sr.id AND cs.status_id = 3
+JOIN observe_user_cases_parts AS pt ON pt.case_id = cs.id
+    AND pt.inn = {inn}
+ORDER BY sr.date_in DESC
+LIMIT {limit}
 """
 
+# Ветка 2: имя в частях дела (без INN)
 _LAST_CASES_BY_NAME_PT = """
-    (
-        SELECT sr.*
-        FROM observe_user_scrap_results AS sr
-        JOIN observe_user_cases AS cs
-          ON cs.result_id = sr.id AND cs.status_id = 3
-        JOIN observe_user_cases_parts AS pt
-          ON pt.case_id = cs.id
-         AND (pt.inn IS NULL OR pt.inn = '')
-         AND to_tsvector('simple', extract_part_name(pt.part_name))
-             @@ plainto_tsquery('simple', norm_party($3))
-        ORDER BY sr.date_in DESC NULLS LAST, sr.id DESC
-        LIMIT $2
-    )
+SELECT sr.*
+FROM observe_user_scrap_results AS sr
+JOIN observe_user_cases AS cs ON cs.result_id = sr.id AND cs.status_id = 3
+JOIN observe_user_cases_parts AS pt ON pt.case_id = cs.id
+    AND (pt.inn IS NULL OR pt.inn = '')
+    AND to_tsvector('simple', extract_part_name(pt.part_name)) @@ plainto_tsquery('simple', norm_party({name}))
+ORDER BY sr.date_in DESC
+LIMIT {limit}
 """
 
+# Ветка 3: имя в plaintiff/defendant
 _LAST_CASES_BY_NAME_SR = """
-    (
-        SELECT sr.*
-        FROM observe_user_scrap_results AS sr
-        WHERE sr.has_case_status_3 = false
-          AND (
-            to_tsvector('simple', extract_plaintiff(sr.case_info))
-                @@ plainto_tsquery('simple', norm_party($3))
-            OR to_tsvector('simple', extract_defendant(sr.case_info))
-                @@ plainto_tsquery('simple', norm_party($3))
-          )
-        ORDER BY sr.date_in DESC NULLS LAST, sr.id DESC
-        LIMIT $2
-    )
+SELECT sr.*
+FROM observe_user_scrap_results AS sr
+WHERE sr.has_case_status_3 = false
+  AND (
+      to_tsvector('simple', extract_plaintiff(sr.case_info)) @@ plainto_tsquery('simple', norm_party({name}))
+      OR to_tsvector('simple', extract_defendant(sr.case_info)) @@ plainto_tsquery('simple', norm_party({name}))
+  )
+ORDER BY sr.date_in DESC
+LIMIT {limit}
 """
-
-# --- без inn (те же ветки, но name = $1) ---
-_LAST_CASES_BY_NAME_PT_NOINN = """
-    (
-        SELECT sr.*
-        FROM observe_user_scrap_results AS sr
-        JOIN observe_user_cases AS cs
-          ON cs.result_id = sr.id AND cs.status_id = 3
-        JOIN observe_user_cases_parts AS pt
-          ON pt.case_id = cs.id
-         AND (pt.inn IS NULL OR pt.inn = '')
-         AND to_tsvector('simple', extract_part_name(pt.part_name))
-             @@ plainto_tsquery('simple', norm_party($1))
-        ORDER BY sr.date_in DESC NULLS LAST, sr.id DESC
-        LIMIT $2
-    )
-"""
-
-_LAST_CASES_BY_NAME_SR_NOINN = """
-    (
-        SELECT sr.*
-        FROM observe_user_scrap_results AS sr
-        WHERE sr.has_case_status_3 = false
-          AND (
-            to_tsvector('simple', extract_plaintiff(sr.case_info))
-                @@ plainto_tsquery('simple', norm_party($1))
-            OR to_tsvector('simple', extract_defendant(sr.case_info))
-                @@ plainto_tsquery('simple', norm_party($1))
-          )
-        ORDER BY sr.date_in DESC NULLS LAST, sr.id DESC
-        LIMIT $2
-    )
-"""
-
-
-async def count_by_inn(conn, inn: str) -> int:
-    """COUNT(DISTINCT pt.case_id) по точному ИНН. Вызывать только если inn непустой."""
-    return await conn.fetchval(_COUNT_SQL_BY_INN, inn)
-
-
-async def count_by_name(conn, name: str) -> int:
-    """COUNT по part_name (inn пуст) + COUNT по plaintiff/defendant в case_info."""
-    return await conn.fetchval(_COUNT_SQL_BY_NAME, name)
 
 
 async def search_count(conn, name: str, inn: Optional[str]) -> int:
+    """Сумма COUNT'ов: один запрос UNION ALL, строки суммируются в Python."""
+    rows = await conn.fetch(build_count_sql(name, inn))
+    return sum(r[0] for r in rows)
+
+
+def build_last_cases_sql(name: str, inn: Optional[str], limit: int = 5) -> str:
     """
-    Сумма COUNT'ов: по ИНН (если есть) + по name (всегда).
-    name — исходный; norm_party применяется в SQL.
+    Собирает итоговый SQL для last_cases (значения — литералы).
+    Используется и в last_cases, и в debug-эндпоинтах (EXPLAIN),
+    чтобы тестировался ровно тот же запрос.
     """
-    total = 0
+    lim = int(limit)
+    n = _lit(name)
+
     if inn:
-        total += await count_by_inn(conn, inn)
-    total += await count_by_name(conn, name)
-    return total
+        i = _lit(inn)
+        branches = f"""
+                (
+                    {_LAST_CASES_BY_INN.format(inn=i, limit=lim)}
+                )
+                UNION ALL
+                (
+                    {_LAST_CASES_BY_NAME_PT.format(name=n, limit=lim)}
+                )
+                UNION ALL
+                (
+                    {_LAST_CASES_BY_NAME_SR.format(name=n, limit=lim)}
+                )
+        """
+    else:
+        branches = f"""
+                (
+                    {_LAST_CASES_BY_NAME_PT.format(name=n, limit=lim)}
+                )
+                UNION ALL
+                (
+                    {_LAST_CASES_BY_NAME_SR.format(name=n, limit=lim)}
+                )
+        """
+
+    return f"""
+        SELECT sc.ethelon_id, sr.case_url, sr.case_num, sr.date_in, sr.case_info, sr.judge
+        FROM (
+            {branches}
+        ) AS sr
+        JOIN observe_user_scrap AS sc ON sc.id = sr.scrap_id
+        ORDER BY sr.date_in DESC, sr.id DESC
+        LIMIT {lim}
+    """
 
 
 async def last_cases(conn, name: str, inn: Optional[str], limit: int = 5) -> list:
-    """
-    До `limit` самых свежих кейсов (date_in DESC, id DESC).
-    Если inn передан — добавляется ветка по pt.inn.
-    Значения передаются только через $N, f-string — для склейки констант.
-    """
-    if inn:
-        sql = f"""
-            SELECT sc.ethelon_id, sr.case_url, sr.case_num, sr.date_in,
-                   sr.case_info, sr.judge
-            FROM (
-                {_LAST_CASES_BY_INN}
-                UNION ALL
-                {_LAST_CASES_BY_NAME_PT}
-                UNION ALL
-                {_LAST_CASES_BY_NAME_SR}
-            ) AS sr
-            JOIN observe_user_scrap sc ON sc.id = sr.scrap_id
-            ORDER BY sr.date_in DESC NULLS LAST, sr.id DESC
-            LIMIT $2
-        """
-        rows = await conn.fetch(sql, inn, limit, name)
-    else:
-        sql = f"""
-            SELECT sc.ethelon_id, sr.case_url, sr.case_num, sr.date_in,
-                   sr.case_info, sr.judge
-            FROM (
-                {_LAST_CASES_BY_NAME_PT_NOINN}
-                UNION ALL
-                {_LAST_CASES_BY_NAME_SR_NOINN}
-            ) AS sr
-            JOIN observe_user_scrap sc ON sc.id = sr.scrap_id
-            ORDER BY sr.date_in DESC NULLS LAST, sr.id DESC
-            LIMIT $2
-        """
-        rows = await conn.fetch(sql, name, limit)
-
+    """До `limit` самых свежих кейсов (тот же запрос, что в pgAdmin)."""
+    rows = await conn.fetch(build_last_cases_sql(name, inn, limit))
     return [dict(r) for r in rows]
+
+
+async def explain_last_cases(conn, name: str, inn: Optional[str], limit: int = 5) -> str:
+    """EXPLAIN (ANALYZE, BUFFERS) для last_cases — для debug-эндпоинта."""
+    sql = "EXPLAIN (ANALYZE, BUFFERS) " + build_last_cases_sql(name, inn, limit)
+    rows = await conn.fetch(sql)
+    return "\n".join(r[0] for r in rows)
+
+
+async def explain_count(conn, name: str, inn: Optional[str]) -> dict:
+    """EXPLAIN (ANALYZE, BUFFERS) того же UNION ALL, что выполняет search_count."""
+    rows = await conn.fetch("EXPLAIN (ANALYZE, BUFFERS) " + build_count_sql(name, inn))
+    return {'count_union_all': "\n".join(r[0] for r in rows)}

@@ -23,7 +23,7 @@ from validators import (
     has_meaningful_word,
     normalize_party,
 )
-from selects import search_count, last_cases
+from selects import search_count, last_cases, explain_last_cases
 
 
 # ---------------------------------------------------------------------------
@@ -125,14 +125,11 @@ class SearchBody(BaseModel):
             if len(name) > 50:
                 raise ValueError('name must be at most 50 characters')
 
-            # формат проверяем на исходном name (до нормализации)
             if not RE_PERSON_NAME.match(name):
                 raise ValueError(
                     'name must contain only Cyrillic letters, spaces, hyphens'
                 )
 
-            # слова считаем после нормализации (дефис -> пробел, ё->е),
-            # чтобы совпадать с тем, как ищется в БД
             words = normalize_party(name).split()
             if not (2 <= len(words) <= 4):
                 raise ValueError('name must be 2-4 words (ФИО)')
@@ -143,11 +140,9 @@ class SearchBody(BaseModel):
                         f'each word must be at least 2 characters, got {w!r}'
                     )
 
-            # защита от абуза: хотя бы одно значимое слово (не ОПФ/служебное/«аааа»)
             if not has_meaningful_word(name):
                 raise ValueError('name must contain a meaningful word')
 
-            # ИНН ИП: is_firm=false + inn 12 цифр -> ИП; без inn -> обычный ФЛ
             if self.inn is not None and self.inn != '':
                 if not is_valid_inn(self.inn, 12):
                     raise ValueError(
@@ -159,19 +154,16 @@ class SearchBody(BaseModel):
             if len(name) > 50:
                 raise ValueError('name must be at most 50 characters')
 
-            # формат проверяем на исходном name (до нормализации)
             if not RE_LEGAL_NAME.match(name):
                 raise ValueError(
                     'name contains characters not allowed for legal entity'
                 )
 
-            # минимум одно слово из 3+ букв (кириллица или латиница)
             if not re.search(r'[А-Яа-яЁёA-Za-z]{3,}', name):
                 raise ValueError(
                     'name must contain at least one word of 3+ letters'
                 )
 
-            # защита от абуза: не только ОПФ/служебные, не «аааа»
             if not has_meaningful_word(name):
                 raise ValueError(
                     'name must contain a meaningful word (not only legal form)'
@@ -202,12 +194,13 @@ async def lifespan(app: FastAPI):
         user=DB_USER, password=DB_PASSWORD, database=DB_NAME,
         min_size=POOL_MIN, max_size=POOL_MAX,
         command_timeout=30, timeout=5,
+        # Значения подставляются в SQL литералами -> каждый запрос уникален,
+        # кэш prepared statements только засоряется.
+        statement_cache_size=0,
         server_settings={
             'timezone': 'Asia/Yekaterinburg',   # «сутки» и date_trunc — по Екатеринбургу
-            'jit': 'off',                    # JIT на COUNT(DISTINCT) часто замедляет
-            'work_mem': '64MB',              # для COUNT(DISTINCT) / hash aggregate
-            'enable_hashjoin': 'off',              
-            'enable_mergejoin': 'off',             
+            'jit': 'off',                       # JIT на COUNT(DISTINCT) часто замедляет
+            'work_mem': '64MB',                 # для COUNT(DISTINCT) / hash aggregate
         },
     )
     log.info(json.dumps({
@@ -386,7 +379,6 @@ async def search(body: SearchBody, request: Request):
             rows = await last_cases(conn, body.name, body.inn, limit=5)
             left_after = await record_ok(conn, consumer, 'search', ip, body_dict)
         result = {'count': count, 'rows': rows}
-        #result = {'count': count}
     finally:
         SEM.release()
 
@@ -398,3 +390,20 @@ async def search(body: SearchBody, request: Request):
         jsonable_encoder({'ok': True, 'quota_left': left_after, 'result': result}),
         headers={'X-Quota-Remaining': str(left_after)},
     )
+
+
+@app.post('/debug/explain')
+async def debug_explain(body: SearchBody, request: Request):
+    # тот же auth, что у /search
+    token = request.headers.get('x-api-key', '')
+    if not token or not hmac.compare_digest(
+        token.encode('utf-8', errors='replace'),
+        API_TOKEN.encode('utf-8'),
+    ):
+        return JSONResponse({'error': 'unauthorized'}, status_code=401)
+
+    # EXPLAIN ровно того же запроса, который выполняет /search
+    async with DB_POOL.acquire() as conn:
+        plan = await explain_last_cases(conn, body.name, body.inn, limit=5)
+
+    return {'plan': plan.split('\n')}
