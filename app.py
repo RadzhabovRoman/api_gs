@@ -23,7 +23,7 @@ from validators import (
     has_meaningful_word,
     normalize_party,
 )
-from selects import cases_count, last_cases, explain_last_cases, explain_count
+from last_cases_selects import cases_count, last_cases, explain_last_cases, explain_count
 
 
 # ---------------------------------------------------------------------------
@@ -31,10 +31,6 @@ from selects import cases_count, last_cases, explain_last_cases, explain_count
 # ---------------------------------------------------------------------------
 API_TOKEN   = os.environ['API_TOKEN']
 DB_PASSWORD = os.environ['DB_PASSWORD']
-
-# /debug/explain выполняет EXPLAIN ANALYZE (реально гоняет тяжёлые запросы мимо лимитов и квоты),
-# поэтому по умолчанию выключен. Для отладки: DEBUG_ENDPOINTS=1 в /etc/api/api.env + рестарт.
-DEBUG_ENDPOINTS = os.environ.get('DEBUG_ENDPOINTS') == '1'
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +340,7 @@ async def cached_count(conn, name: str, inn: Optional[str], region_id: Optional[
     if hit and hit[0] > now:
         return hit[1], True
 
-    count = await search_count(conn, name, inn, region_id)
+    count = await cases_count(conn, name, inn, region_id)
 
     if len(_count_cache) >= COUNT_CACHE_MAX:
         for k in [k for k, v in _count_cache.items() if v[0] <= now]:
@@ -443,29 +439,3 @@ async def last_5_cases(body: SearchBody, request: Request):
         jsonable_encoder({'ok': True, 'quota_left': left_after, 'result': result}),
         headers={'X-Quota-Remaining': str(left_after)},
     )
-
-
-async def debug_explain(body: SearchBody, request: Request):
-    # тот же auth, что у /last_5_cases
-    token = request.headers.get('x-api-key', '')
-    if not token or not hmac.compare_digest(
-        token.encode('utf-8', errors='replace'),
-        API_TOKEN.encode('utf-8'),
-    ):
-        return JSONResponse({'error': 'unauthorized'}, status_code=401)
-
-    # EXPLAIN ровно тех же запросов, что выполняет /last_5_cases, в том же порядке:
-    # сначала count, потом последние 5 кейсов. Квоту не тратит.
-    async with DB_POOL.acquire() as conn:
-        count_plans = await explain_count(conn, body.name, body.inn, body.region_id)
-        cases_plan = await explain_last_cases(conn, body.name, body.inn, 
-                                              region_id=body.region_id)
-
-    return {
-        'count_plans': {k: v.split('\n') for k, v in count_plans.items()},
-        'plan': cases_plan.split('\n'),      # план last_cases (как и раньше)
-    }
-
-
-if DEBUG_ENDPOINTS:
-    app.post('/debug/explain')(debug_explain)
