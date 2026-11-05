@@ -7,7 +7,7 @@ import re
 import time
 import hmac
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Optional, List
 from fastapi.encoders import jsonable_encoder
 
 import asyncpg
@@ -204,7 +204,7 @@ class LastCasesBody(PartyBody):
 
 
 class LastDaysBody(PartyBody):
-    region_id_lst: list[int] = Field(min_length=1)
+    region_id_lst: List[int] = Field(min_length=1)
 
     def _validate_region(self):
         if len(set(self.region_id_lst)) != len(self.region_id_lst):
@@ -329,10 +329,8 @@ async def record_ok(conn, consumer: str, kind: str, ip: str, body: dict, weight:
         WITH ins AS (
             INSERT INTO api_requests (consumer, kind, ip, body, weight)
             VALUES ($1, $2, $3::inet, $4::jsonb, $5)
-            RETURNING 1
+            RETURNING weight
         )
-        -- основной запрос не видит строку, вставленную в этом же выражении (одна копия снимка),
-        -- поэтому только что записанный запрос добавляем отдельно: + (SELECT sum(weight) FROM ins)
         SELECT GREATEST(0, $6::int - (
             COALESCE((SELECT sum(weight) FROM api_requests
                       WHERE consumer = $1
