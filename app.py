@@ -13,7 +13,7 @@ from fastapi.encoders import jsonable_encoder
 import asyncpg
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from regions import VALID_REGIONS
 from validators import (
@@ -24,7 +24,7 @@ from validators import (
     normalize_party,
 )
 from last_cases_selects import cases_count, last_cases
-
+from last_days_selects import last_days
 
 # ---------------------------------------------------------------------------
 # Секреты из окружения (EnvironmentFile=/etc/api/api.env)
@@ -47,13 +47,14 @@ MAX_CONCURRENT      = 2      # максимум одновременных за�
 POOL_MIN            = 1      # минимум соединений в пуле
 POOL_MAX            = 2      # максимум соединений к Postgres (жёсткий потолок)
 WAIT_FOR_SLOT       = 30     # сек: сколько ждать слот семафора, потом 503
-LAST_5_CASES_LIMIT  = 100    # квота: успешных SELECT в сутки на потребителя
 RATE                = 0.2    # rate limit: токенов в секунду (0.2 = 1 токен за 5 с)
 BURST               = 2      # rate limit: сколько запросов можно сразу (всплеск)
 DENIAL_THRESHOLD    = 5      # писать отказ в БД, когда за минуту набралось >= 5
 COUNT_TTL           = 6 * 3600   # сек: сколько хранить count в памяти (сами кейсы всегда свежие)
 COUNT_CACHE_MAX     = 5000       # максимум записей в кэше count
 
+LAST_5_CASES_LIMIT  = 100    # квота на LAST_5_CASES сутки-потребитель
+LAST_5_DAYS_LIMIT   = 500    # квота на LAST_5_DAYS сутки-потребитель
 
 # ---------------------------------------------------------------------------
 # Логи: JSON в stdout -> journald
@@ -76,7 +77,7 @@ DB_POOL: Optional[asyncpg.Pool] = None
 _denial_counts: dict = {}
 
 
-# Кэш count: {(имя, инн): (истекает_monotonic, count)}. Живёт в памяти процесса
+# Кэш count: {(kind, имя, инн, region_id): (истекает, count)}. Живёт в памяти процесса
 # (работает при --workers 1), сбрасывается при рестарте.
 _count_cache: dict = {}
 
@@ -111,20 +112,23 @@ def consumer_hash(token: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Валидация тела POST /last_5_cases
+# Общая база: поля is_firm / name / inn + валидация ФЛ/ИП/ЮЛ.
+# Регион сюда НЕ входит — его добавляют наследники.
 # ---------------------------------------------------------------------------
-class SearchBody(BaseModel):
-    # forbid: любое неизвестное поле (например, add_name) -> 422,
-    # клиент сразу видит опечатку, а не молчаливое игнорирование.
+class PartyBody(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
-    is_firm:   bool                    # true = ЮЛ, false = ФЛ/ИП
-    name:      str                     # ФИО (для ФЛ/ИП) или наименование (для ЮЛ)
-    inn:       Optional[str] = None    # 10 цифр для ЮЛ, 12 для ИП; для ФЛ не нужен
-    region_id: Optional[int] = None    # регион, опционально
+    is_firm: bool
+    name:    str
+    inn:     Optional[str] = None
 
-    @model_validator(mode='after')
-    def validate_by_type(self):
+    # --- хук, который переопределяют наследники ---
+    def _validate_region(self):
+        """По умолчанию регион не проверяется."""
+        pass
+
+    # --- общая валидация ФЛ/ИП/ЮЛ (наследники её не трогают) ---
+    def _validate_party(self):
         name = (self.name or '').strip()
 
         if not self.is_firm:
@@ -181,13 +185,35 @@ class SearchBody(BaseModel):
             if not is_valid_inn(self.inn, 10):
                 raise ValueError('inn must be exactly 10 digits, not all identical')
 
-        # --- region_id ---
+    # --- единственный model_validator ---
+    @model_validator(mode='after')
+    def validate_by_type(self):
+        self._validate_party()
+        self._validate_region()
+        return self
+
+
+class LastCasesBody(PartyBody):
+    region_id: Optional[int] = None
+
+    def _validate_region(self):
         if self.region_id is not None and self.region_id not in VALID_REGIONS:
             raise ValueError(
                 f'region_id must be one of allowed regions, got {self.region_id}'
             )
 
-        return self
+
+class LastDaysBody(PartyBody):
+    region_id_lst: list[int] = Field(min_length=1)
+
+    def _validate_region(self):
+        if len(set(self.region_id_lst)) != len(self.region_id_lst):
+            raise ValueError('region_id_lst must not contain duplicates')
+        for r in self.region_id_lst:
+            if r not in VALID_REGIONS:
+                raise ValueError(
+                    f'region_id_lst must contain only allowed regions, got {r}'
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +242,7 @@ async def lifespan(app: FastAPI):
         'max_concurrent': MAX_CONCURRENT, 'pool_max': POOL_MAX,
         'rate': RATE, 'burst': BURST,
         'LAST_5_CASES_LIMIT': LAST_5_CASES_LIMIT, 'denial_threshold': DENIAL_THRESHOLD,
+        'LAST_5_DAYS_LIMIT': LAST_5_DAYS_LIMIT,
     }))
     yield
     await DB_POOL.close()
@@ -244,7 +271,7 @@ async def seconds_until_midnight(conn) -> int:
     )
 
 
-async def check_quota(conn, consumer: str, kind: str, limit: int):
+async def check_quota(conn, consumer: str, kind: str, limit: int, weight: int = 1):
     """Возвращает (можно_ещё, осталось). Считает успешные SELECT за сегодня."""
     used = await conn.fetchval(
         """SELECT sum(weight) FROM api_requests
@@ -255,7 +282,7 @@ async def check_quota(conn, consumer: str, kind: str, limit: int):
         consumer, kind,
     )
     used = used or 0
-    return used < limit, limit - used
+    return used + weight <= limit, limit - used
 
 
 async def record_denial_if_threshold(conn, consumer: str, kind: str, ip: str) -> int:
@@ -330,12 +357,12 @@ async def acquire_slot():
         raise HTTPException(status_code=503, detail='server busy')
 
 
-async def cached_count(conn, name: str, inn: Optional[str], region_id: Optional[int] = None):
+async def cached_count(conn, kind: str, name: str, inn: Optional[str], region_id: Optional[int] = None):
     """
-    count с кэшем по (имя, инн, регион). Возвращает (count, из_кэша).
+    count с кэшем по (kind, имя, инн, регион). Возвращает (count, из_кэша).
     Для крупных имён (Сбербанк и т.п.) подсчёт дорогой, а число меняется медленно.
     """
-    key = (' '.join(name.lower().split()), inn or '', region_id)
+    key = (kind, ' '.join(name.lower().split()), inn or '', region_id)
     now = time.monotonic()
 
     hit = _count_cache.get(key)
@@ -363,7 +390,7 @@ def health():
 
 
 @app.post('/last_5_cases')
-async def last_5_cases(body: SearchBody, request: Request):
+async def last_5_cases(body: LastCasesBody, request: Request):
     # 1. auth
     token = request.headers.get('x-api-key', '')
     if not token or not hmac.compare_digest(
@@ -416,7 +443,7 @@ async def last_5_cases(body: SearchBody, request: Request):
         # 5. данные + запись в квоту (одно соединение на оба действия)
         async with DB_POOL.acquire() as conn:
             t0 = time.perf_counter()
-            count, count_cached = await cached_count(conn, body.name, body.inn, body.region_id)
+            count, count_cached = await cached_count(conn, 'last_5_cases', body.name, body.inn, body.region_id)
             t1 = time.perf_counter()
             rows = await last_cases(conn, body.name, body.inn, region_id=body.region_id)
             t2 = time.perf_counter()
@@ -441,3 +468,82 @@ async def last_5_cases(body: SearchBody, request: Request):
         jsonable_encoder({'ok': True, 'quota_left': left_after, 'result': result}),
         headers={'X-Quota-Remaining': str(left_after)},
     )
+
+
+@app.post('/last_5_days')
+async def last_5_days(body: LastDaysBody, request: Request):
+    # 1. auth
+    token = request.headers.get('x-api-key', '')
+    if not token or not hmac.compare_digest(
+        token.encode('utf-8', errors='replace'),
+        API_TOKEN.encode('utf-8'),
+    ):
+        return JSONResponse({'error': 'unauthorized'}, status_code=401)
+
+    consumer = consumer_hash(token)
+    ip = request.client.host if request.client else '0.0.0.0'
+
+    # 2. rate limit (in-memory, до БД)
+    allowed, retry_after = RATE_LIMITER.allow(token)
+    if not allowed:
+        async with DB_POOL.acquire() as conn:
+            count = await record_denial_if_threshold(conn, consumer, 'rate_limited', ip)
+        log.info(json.dumps({
+            'event': 'rate_limited', 'consumer': consumer,
+            'count_min': count, 'retry_after': round(retry_after, 2),
+        }))
+        return JSONResponse(
+            {'error': 'rate limited', 'retry_after': round(retry_after, 2)},
+            status_code=429,
+            headers={'Retry-After': str(int(retry_after) + 1)},
+        )
+
+    body_dict = body.dict()
+
+    # 3. квота (Postgres, до семафора)
+    weight = len(body.region_id_lst)
+    async with DB_POOL.acquire() as conn:
+        ok, _ = await check_quota(conn, consumer, 'last_5_days', LAST_5_DAYS_LIMIT, weight)
+        if not ok:
+            count = await record_denial_if_threshold(conn, consumer, 'quota_exceeded', ip)
+            retry = await seconds_until_midnight(conn)
+            log.info(json.dumps({
+                'event': 'quota_exceeded', 'consumer': consumer, 'count_min': count,
+            }))
+            return JSONResponse(
+                {'error': 'quota exhausted', 'limit': LAST_5_DAYS_LIMIT},
+                status_code=429,
+                headers={
+                    'Retry-After': str(retry),
+                    'X-Quota-Remaining': '0',
+                },
+            )
+
+    # 4. семафор (макс 2 одновременно)
+    await acquire_slot()
+    try:
+        # 5. данные + запись в квоту (одно соединение на оба действия)
+        async with DB_POOL.acquire() as conn:
+            t1 = time.perf_counter()
+            rows = await last_days(conn, body.name, body.inn, region_id_lst=body.region_id_lst)
+            t2 = time.perf_counter()
+            left_after = await record_ok(conn, consumer, 'last_5_days', ip, body_dict, len(body.region_id_lst), LAST_5_DAYS_LIMIT)
+        result = {'rows': rows}
+    except (asyncio.TimeoutError, asyncpg.exceptions.QueryCanceledError):
+        # запрос не уложился в лимит времени; квота не списывается 
+        log.warning(json.dumps({
+            'event': 'last_5_days_timeout', 'consumer': consumer, 'ip': ip,
+            'is_firm': body.is_firm, 'has_inn': bool(body.inn), 'region_id_lst': body.region_id_lst,
+        }))
+        return JSONResponse({'error': 'query timeout'}, status_code=504)
+    finally:
+        SEM.release()
+
+    log.info(json.dumps({
+        'event': 'last_5_days_ok', 'consumer': consumer,
+        'ip': ip, 'quota_left': left_after, 'cases_ms': round((t2 - t1) * 1000),
+    }))
+    return JSONResponse(
+        jsonable_encoder({'ok': True, 'quota_left': left_after, 'result': result}),
+        headers={'X-Quota-Remaining': str(left_after)},
+    )    
