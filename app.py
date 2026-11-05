@@ -23,7 +23,7 @@ from validators import (
     has_meaningful_word,
     normalize_party,
 )
-from last_cases_selects import cases_count, last_cases, explain_last_cases, explain_count
+from last_cases_selects import cases_count, last_cases
 
 
 # ---------------------------------------------------------------------------
@@ -252,8 +252,9 @@ async def check_quota(conn, consumer: str, kind: str, limit: int):
              AND kind = $2
              AND requested_at >= date_trunc('day', now())
              AND requested_at <  date_trunc('day', now()) + interval '1 day'""",
-        consumer,
+        consumer, kind,
     )
+    used = used or 0
     return used < limit, limit - used
 
 
@@ -291,7 +292,7 @@ async def record_denial_if_threshold(conn, consumer: str, kind: str, ip: str) ->
     return count
 
 
-async def record_ok(conn, consumer: str, kind: str, ip: str, body: dict, limit: int) -> int:
+async def record_ok(conn, consumer: str, kind: str, ip: str, body: dict, weight: int, limit: int) -> int:
     """
     Запись успешного SELECT (идёт в квоту).
     Возвращает остаток квоты ПОСЛЕ вставки (сколько ещё можно за сегодня).
@@ -299,21 +300,22 @@ async def record_ok(conn, consumer: str, kind: str, ip: str, body: dict, limit: 
     row = await conn.fetchrow(
         """
         WITH ins AS (
-            INSERT INTO api_requests (consumer, kind, ip, body)
-            VALUES ($1, $2, $3::inet, $4::jsonb)
+            INSERT INTO api_requests (consumer, kind, ip, body, weight)
+            VALUES ($1, $2, $3::inet, $4::jsonb, $5)
             RETURNING 1
         )
         -- основной запрос не видит строку, вставленную в этом же выражении (одна копия снимка),
-        -- поэтому только что записанный запрос добавляем отдельно: + (SELECT count(*) FROM ins)
-        SELECT GREATEST(0, $5::int - (
-            (SELECT count(*) FROM api_requests
-             WHERE consumer = $1
-               AND requested_at >= date_trunc('day', now())
-               AND requested_at <  date_trunc('day', now()) + interval '1 day')
-            + (SELECT count(*) FROM ins)
+        -- поэтому только что записанный запрос добавляем отдельно: + (SELECT sum(weight) FROM ins)
+        SELECT GREATEST(0, $6::int - (
+            COALESCE((SELECT sum(weight) FROM api_requests
+                      WHERE consumer = $1
+                        AND kind = $2
+                        AND requested_at >= date_trunc('day', now())
+                        AND requested_at <  date_trunc('day', now()) + interval '1 day'), 0)
+            + (SELECT COALESCE(sum(weight), 0) FROM ins)
         )) AS left
         """,
-        consumer, kind, ip, json.dumps(body), limit,
+        consumer, kind, ip, json.dumps(body), weight, limit,
     )
     return row['left']
 
@@ -392,7 +394,7 @@ async def last_5_cases(body: SearchBody, request: Request):
 
     # 3. квота (Postgres, до семафора)
     async with DB_POOL.acquire() as conn:
-        ok, _ = await check_quota(conn, consumer, LAST_5_CASES_LIMIT)
+        ok, _ = await check_quota(conn, consumer, 'last_5_cases', LAST_5_CASES_LIMIT)
         if not ok:
             count = await record_denial_if_threshold(conn, consumer, 'quota_exceeded', ip)
             retry = await seconds_until_midnight(conn)
@@ -418,10 +420,10 @@ async def last_5_cases(body: SearchBody, request: Request):
             t1 = time.perf_counter()
             rows = await last_cases(conn, body.name, body.inn, region_id=body.region_id)
             t2 = time.perf_counter()
-            left_after = await record_ok(conn, consumer, 'last_5_cases', ip, body_dict, LAST_5_CASES_LIMIT)
+            left_after = await record_ok(conn, consumer, 'last_5_cases', ip, body_dict, 1, LAST_5_CASES_LIMIT)
         result = {'count': count, 'rows': rows}
     except (asyncio.TimeoutError, asyncpg.exceptions.QueryCanceledError):
-        # запрос не уложился в лимит времени; квота не списывается (record_ok не выполнен)
+        # запрос не уложился в лимит времени; квота не списывается 
         log.warning(json.dumps({
             'event': 'last_5_cases_timeout', 'consumer': consumer, 'ip': ip,
             'is_firm': body.is_firm, 'has_inn': bool(body.inn), 'region_id': body.region_id,

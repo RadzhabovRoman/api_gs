@@ -1,5 +1,5 @@
 """
-selects.py — SQL-запросы и обёртки над asyncpg для API.
+last_cases_selects.py — SQL-запросы и обёртки над asyncpg для API.
 
 ВАЖНО: значения inn / name / region / limit подставляются в SQL ЛИТЕРАЛАМИ (с экранированием
 или приведением к int), а не через $1/$2. Так планировщик Postgres видит константы и строит
@@ -309,8 +309,6 @@ def build_last_cases_sql(name: str, inn: Optional[str], limit: int = 5,
                          region_id: Optional[int] = None) -> str:
     """
     Собирает итоговый SQL для last_cases (значения — литералы).
-    Используется и в last_cases,
-    чтобы тестировался ровно тот же запрос.
     """
     lim = int(limit)
     n = _lit(name)
