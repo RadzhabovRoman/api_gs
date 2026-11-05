@@ -23,7 +23,7 @@ from validators import (
     has_meaningful_word,
     normalize_party,
 )
-from selects import search_count, last_cases, explain_last_cases, explain_count
+from selects import cases_count, last_cases, explain_last_cases, explain_count
 
 
 # ---------------------------------------------------------------------------
@@ -47,16 +47,16 @@ DB_NAME, DB_USER = 'sudrf', 'postgres'
 # ---------------------------------------------------------------------------
 # Ограничители и лимиты
 # ---------------------------------------------------------------------------
-MAX_CONCURRENT   = 2      # максимум одновременных запросов (семафор), = POOL_MAX
-POOL_MIN         = 1      # минимум соединений в пуле
-POOL_MAX         = 2      # максимум соединений к Postgres (жёсткий потолок)
-WAIT_FOR_SLOT    = 30     # сек: сколько ждать слот семафора, потом 503
-DAILY_LIMIT      = 100    # квота: успешных SELECT в сутки на потребителя
-RATE             = 0.2    # rate limit: токенов в секунду (0.2 = 1 токен за 5 с)
-BURST            = 2      # rate limit: сколько запросов можно сразу (всплеск)
-DENIAL_THRESHOLD = 5      # писать отказ в БД, когда за минуту набралось >= 5
-COUNT_TTL        = 6 * 3600   # сек: сколько хранить count в памяти (сами кейсы всегда свежие)
-COUNT_CACHE_MAX  = 5000       # максимум записей в кэше count
+MAX_CONCURRENT      = 2      # максимум одновременных запросов (семафор), = POOL_MAX
+POOL_MIN            = 1      # минимум соединений в пуле
+POOL_MAX            = 2      # максимум соединений к Postgres (жёсткий потолок)
+WAIT_FOR_SLOT       = 30     # сек: сколько ждать слот семафора, потом 503
+LAST_5_CASES_LIMIT  = 100    # квота: успешных SELECT в сутки на потребителя
+RATE                = 0.2    # rate limit: токенов в секунду (0.2 = 1 токен за 5 с)
+BURST               = 2      # rate limit: сколько запросов можно сразу (всплеск)
+DENIAL_THRESHOLD    = 5      # писать отказ в БД, когда за минуту набралось >= 5
+COUNT_TTL           = 6 * 3600   # сек: сколько хранить count в памяти (сами кейсы всегда свежие)
+COUNT_CACHE_MAX     = 5000       # максимум записей в кэше count
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +115,7 @@ def consumer_hash(token: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Валидация тела POST /search
+# Валидация тела POST /last_5_cases
 # ---------------------------------------------------------------------------
 class SearchBody(BaseModel):
     # forbid: любое неизвестное поле (например, add_name) -> 422,
@@ -219,7 +219,7 @@ async def lifespan(app: FastAPI):
         'event': 'startup', 'db': DB_NAME,
         'max_concurrent': MAX_CONCURRENT, 'pool_max': POOL_MAX,
         'rate': RATE, 'burst': BURST,
-        'daily_limit': DAILY_LIMIT, 'denial_threshold': DENIAL_THRESHOLD,
+        'LAST_5_CASES_LIMIT': LAST_5_CASES_LIMIT, 'denial_threshold': DENIAL_THRESHOLD,
     }))
     yield
     await DB_POOL.close()
@@ -233,6 +233,8 @@ app = FastAPI(
     openapi_url=None,     # /openapi.json закрыт
 )
 
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+app.add_middleware(ProxyHeadersMiddleware, trusted_hosts='127.0.0.1')
 
 # ---------------------------------------------------------------------------
 # Вспомогательные функции
@@ -246,16 +248,17 @@ async def seconds_until_midnight(conn) -> int:
     )
 
 
-async def check_quota(conn, consumer: str):
+async def check_quota(conn, consumer: str, kind: str, limit: int):
     """Возвращает (можно_ещё, осталось). Считает успешные SELECT за сегодня."""
     used = await conn.fetchval(
-        """SELECT count(*) FROM api_requests
+        """SELECT sum(weight) FROM api_requests
            WHERE consumer = $1
+             AND kind = $2
              AND requested_at >= date_trunc('day', now())
              AND requested_at <  date_trunc('day', now()) + interval '1 day'""",
         consumer,
     )
-    return used < DAILY_LIMIT, DAILY_LIMIT - used
+    return used < limit, limit - used
 
 
 async def record_denial_if_threshold(conn, consumer: str, kind: str, ip: str) -> int:
@@ -292,7 +295,7 @@ async def record_denial_if_threshold(conn, consumer: str, kind: str, ip: str) ->
     return count
 
 
-async def record_ok(conn, consumer: str, kind: str, ip: str, body: dict) -> int:
+async def record_ok(conn, consumer: str, kind: str, ip: str, body: dict, limit: int) -> int:
     """
     Запись успешного SELECT (идёт в квоту).
     Возвращает остаток квоты ПОСЛЕ вставки (сколько ещё можно за сегодня).
@@ -314,7 +317,7 @@ async def record_ok(conn, consumer: str, kind: str, ip: str, body: dict) -> int:
             + (SELECT count(*) FROM ins)
         )) AS left
         """,
-        consumer, kind, ip, json.dumps(body), DAILY_LIMIT,
+        consumer, kind, ip, json.dumps(body), limit,
     )
     return row['left']
 
@@ -361,8 +364,8 @@ def health():
     return {'ok': True}
 
 
-@app.post('/search')
-async def search(body: SearchBody, request: Request):
+@app.post('/last_5_cases')
+async def last_5_cases(body: SearchBody, request: Request):
     # 1. auth
     token = request.headers.get('x-api-key', '')
     if not token or not hmac.compare_digest(
@@ -393,7 +396,7 @@ async def search(body: SearchBody, request: Request):
 
     # 3. квота (Postgres, до семафора)
     async with DB_POOL.acquire() as conn:
-        ok, _ = await check_quota(conn, consumer)
+        ok, _ = await check_quota(conn, consumer, LAST_5_CASES_LIMIT)
         if not ok:
             count = await record_denial_if_threshold(conn, consumer, 'quota_exceeded', ip)
             retry = await seconds_until_midnight(conn)
@@ -401,7 +404,7 @@ async def search(body: SearchBody, request: Request):
                 'event': 'quota_exceeded', 'consumer': consumer, 'count_min': count,
             }))
             return JSONResponse(
-                {'error': 'quota exhausted', 'limit': DAILY_LIMIT},
+                {'error': 'quota exhausted', 'limit': LAST_5_CASES_LIMIT},
                 status_code=429,
                 headers={
                     'Retry-After': str(retry),
@@ -417,14 +420,14 @@ async def search(body: SearchBody, request: Request):
             t0 = time.perf_counter()
             count, count_cached = await cached_count(conn, body.name, body.inn, body.region_id)
             t1 = time.perf_counter()
-            rows = await last_cases(conn, body.name, body.inn, limit=5, region_id=body.region_id)
+            rows = await last_cases(conn, body.name, body.inn, region_id=body.region_id)
             t2 = time.perf_counter()
-            left_after = await record_ok(conn, consumer, 'search', ip, body_dict)
+            left_after = await record_ok(conn, consumer, 'last_5_cases', ip, body_dict, LAST_5_CASES_LIMIT)
         result = {'count': count, 'rows': rows}
     except (asyncio.TimeoutError, asyncpg.exceptions.QueryCanceledError):
         # запрос не уложился в лимит времени; квота не списывается (record_ok не выполнен)
         log.warning(json.dumps({
-            'event': 'search_timeout', 'consumer': consumer, 'ip': ip,
+            'event': 'last_5_cases_timeout', 'consumer': consumer, 'ip': ip,
             'is_firm': body.is_firm, 'has_inn': bool(body.inn), 'region_id': body.region_id,
         }))
         return JSONResponse({'error': 'query timeout'}, status_code=504)
@@ -432,7 +435,7 @@ async def search(body: SearchBody, request: Request):
         SEM.release()
 
     log.info(json.dumps({
-        'event': 'search_ok', 'consumer': consumer,
+        'event': 'last_5_cases_ok', 'consumer': consumer,
         'ip': ip, 'quota_left': left_after, 'count_cached': count_cached,
         'count_ms': round((t1 - t0) * 1000), 'cases_ms': round((t2 - t1) * 1000),
     }))
@@ -443,7 +446,7 @@ async def search(body: SearchBody, request: Request):
 
 
 async def debug_explain(body: SearchBody, request: Request):
-    # тот же auth, что у /search
+    # тот же auth, что у /last_5_cases
     token = request.headers.get('x-api-key', '')
     if not token or not hmac.compare_digest(
         token.encode('utf-8', errors='replace'),
@@ -451,11 +454,11 @@ async def debug_explain(body: SearchBody, request: Request):
     ):
         return JSONResponse({'error': 'unauthorized'}, status_code=401)
 
-    # EXPLAIN ровно тех же запросов, что выполняет /search, в том же порядке:
+    # EXPLAIN ровно тех же запросов, что выполняет /last_5_cases, в том же порядке:
     # сначала count, потом последние 5 кейсов. Квоту не тратит.
     async with DB_POOL.acquire() as conn:
         count_plans = await explain_count(conn, body.name, body.inn, body.region_id)
-        cases_plan = await explain_last_cases(conn, body.name, body.inn, limit=5,
+        cases_plan = await explain_last_cases(conn, body.name, body.inn, 
                                               region_id=body.region_id)
 
     return {

@@ -6,7 +6,7 @@ selects.py — SQL-запросы и обёртки над asyncpg для API.
 тот же план, что и в pgAdmin (без generic-плана prepared statement).
 
 Состав:
-  - count: один UNION ALL из 2-3 веток, суммируется в Python (search_count);
+  - count: один UNION ALL из 2-3 веток, суммируется в Python (cases_count);
   - last_cases: до N самых свежих дел; ветки выбирают только id и date_in (узкие колонки),
     полные строки подтягиваются для итоговых N дел;
   - explain_*: EXPLAIN (ANALYZE, BUFFERS) тех же запросов для /debug/explain.
@@ -115,7 +115,7 @@ def build_count_sql(name: str, inn: Optional[str], region_id: Optional[int] = No
     return "\nUNION ALL\n".join(parts)
 
 
-async def search_count(conn, name: str, inn: Optional[str], region_id: Optional[int] = None) -> int:
+async def cases_count(conn, name: str, inn: Optional[str], region_id: Optional[int] = None) -> int:
     """Сумма COUNT'ов: один запрос UNION ALL, строки суммируются в Python."""
     timeout = COUNT_REGION_TIMEOUT if region_id is not None else None   # None = command_timeout пула
     rows = await conn.fetch(build_count_sql(name, inn, region_id), timeout=timeout)
@@ -337,7 +337,7 @@ async def explain_last_cases(conn, name: str, inn: Optional[str], limit: int = 5
 
 
 async def explain_count(conn, name: str, inn: Optional[str], region_id: Optional[int] = None) -> dict:
-    """EXPLAIN (ANALYZE, BUFFERS) того же UNION ALL, что выполняет search_count."""
+    """EXPLAIN (ANALYZE, BUFFERS) того же UNION ALL, что выполняет cases_count."""
     timeout = COUNT_REGION_TIMEOUT if region_id is not None else None
     rows = await conn.fetch("EXPLAIN (ANALYZE, BUFFERS) " + build_count_sql(name, inn, region_id),
                             timeout=timeout)
